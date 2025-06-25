@@ -193,7 +193,7 @@ Configure your network devices to send syslog to your server:
 
 ```bash
 # Cisco example
-logging host <server-ip>
+logging host <server-ip> transport udp port 1514
 logging facility local5
 logging trap informational
 
