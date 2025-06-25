@@ -19,7 +19,7 @@ Transform your network logs into intelligent, searchable insights using GPU-acce
 ## ✨ Features
 
 ### 🚀 Real-time Processing
-- **High-throughput ingestion**: Processes 250+ messages/minute
+- **High-throughput ingestion**: Processes 6,000+ messages/minute
 - **GPU-accelerated embeddings**: NVIDIA CUDA support with 1024-dimensional vectors
 - **Intelligent batching**: Optimized batch processing for maximum efficiency
 - **Live monitoring**: Real-time dashboard with processing metrics
@@ -424,9 +424,9 @@ du -sh /var/syslog_chromadb
 ```
 
 #### Performance Metrics
-- **Optimal rate**: 250-500 messages/minute
+- **Optimal rate**: 6,000+ messages/minute (100+ msg/sec)
 - **GPU memory**: 2-4GB for large model
-- **Batch processing**: 0.8-2.0 seconds per batch
+- **Batch processing**: 0.8-2.0 seconds per 200-message batch
 - **Database growth**: ~1-2GB per million messages
 
 ## 🎯 Use Cases
@@ -479,7 +479,8 @@ du -sh /var/syslog_chromadb
 
 | Metric | Value |
 |--------|-------|
-| Ingestion Rate | 250-500 msg/min |
+| Ingestion Rate | 6,000+ msg/min |
+| Batch Processing | 200 msgs every 2 seconds |
 | Search Response | <500ms |
 | GPU Memory | 2-4GB |
 | Storage Efficiency | ~2MB per 1000 messages |
