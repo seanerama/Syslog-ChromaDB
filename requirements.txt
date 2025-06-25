@@ -1,0 +1,24 @@
+# Syslog AI Analytics - Requirements
+# Install PyTorch separately with CUDA support using the commands in README
+
+# Core ML and AI
+transformers>=4.35.0
+sentence-transformers>=2.2.0
+numpy>=1.24.0
+
+# Vector Database
+chromadb>=0.4.0
+
+# Web Framework and API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+jinja2>=3.1.0
+python-multipart>=0.0.6
+
+# Data Processing
+pandas>=2.0.0
+
+# Note: PyTorch should be installed separately with CUDA support:
+# For CUDA 12.1: uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# For CUDA 11.8: uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118  
+# For CPU only:  uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
