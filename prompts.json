@@ -1,0 +1,19 @@
+{
+    "intent_parsing": {
+      "template": "Analyze this query about our network infrastructure and extract structured information. Return ONLY valid JSON.\n\nQuery: \"{message}\"\n\nOur Network Context:\n- Core routers: rtr-core-01, rtr-core-02\n- Access switches: sw-access-XX (where XX is floor number)\n- Firewalls: fw-perimeter, fw-dmz\n- Servers: srv-dc-XX, srv-web-XX\n- VPN concentrators: vpn-primary, vpn-backup\n- IP ranges: 10.0.0.0/8 (internal), 192.168.0.0/16 (mgmt)\n\nExtract:\n1. intent: one of [\"find_issues\", \"show_logs\", \"get_stats\", \"recent_logs\", \"general_search\"]\n2. devices: list of device names, IPs, or hostnames mentioned\n3. time_refs: list of time references like [\"1h\", \"1d\", \"7d\"]\n4. severity_keywords: list of severity levels (0-7)\n5. search_terms: key terms for semantic search\n\nIntent Classification Rules:\n- \"error\", \"fail\", \"down\", \"issue\", \"alert\", \"problem\" → \"find_issues\"\n- \"show\", \"list\", \"get\", \"find\", \"display\" → \"show_logs\"\n- \"stats\", \"count\", \"how many\", \"summary\", \"overview\" → \"get_stats\"\n- \"recent\", \"latest\", \"last\", \"today\", \"current\" → \"recent_logs\"\n- Everything else → \"general_search\"\n\nDevice Pattern Recognition:\n- Router patterns: rtr-*, router-*, core-*\n- Switch patterns: sw-*, switch-*, access-*\n- Server patterns: srv-*, server-*\n- Firewall patterns: fw-*, firewall-*\n- IP addresses: any valid IPv4\n- Hostnames: device-location-number format\n\nTime Reference Mapping:\n- \"hour\", \"hr\" → \"1h\"\n- \"day\", \"today\", \"daily\" → \"1d\"\n- \"week\", \"weekly\" → \"7d\"\n- \"month\", \"monthly\" → \"30d\"\n\nSeverity Mapping:\n- \"emergency\" → 0, \"alert\" → 1, \"critical\" → 2, \"error\" → 3\n- \"warning\" → 4, \"notice\" → 5, \"info\" → 6, \"debug\" → 7\n\nReturn JSON format:\n{{\"intent\": \"...\", \"devices\": [...], \"time_refs\": [...], \"severity_keywords\": [...], \"search_terms\": [...]}}",
+      "fallback_template": "Analyze this query and return JSON: {{\"intent\": \"general_search\", \"devices\": [], \"time_refs\": [], \"severity_keywords\": [], \"search_terms\": [\"{message}\"]}}"
+    },
+    "analysis_response": {
+      "template": "You are a network security expert analyzing logs for our enterprise network.\n\nUser Question: \"{user_question}\"\n\nSearch Results: {total_results_found} relevant entries found\n\nTop Log Entries:\n{sample_logs}\n\nDatabase Queries Executed:\n{queries_executed}\n\nProvide a concise, actionable analysis focusing on:\n1. Direct answer to the user's question\n2. Any network issues or security concerns identified\n3. Specific devices or patterns mentioned in logs\n4. Recommended next steps if issues found\n5. If no relevant logs found, suggest alternative search terms\n\nKeep response professional and technical but accessible.",
+      "no_results_template": "I searched the syslog database but found no relevant entries for your query: \"{user_question}\"\n\nSuggestions:\n- Try broader search terms\n- Check device names (rtr-*, sw-*, srv-*)\n- Verify time range if searching recent events\n- Use severity keywords (error, warning, critical)\n\nWould you like me to search for something else?"
+    },
+    "network_config": {
+      "device_prefixes": ["rtr-", "sw-", "srv-", "fw-", "vpn-"],
+      "ip_ranges": ["10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"],
+      "severity_levels": {
+        "emergency": 0, "alert": 1, "critical": 2, "error": 3,
+        "warning": 4, "notice": 5, "info": 6, "debug": 7
+      },
+      "common_services": ["BGP", "OSPF", "SNMP", "SSH", "HTTPS", "DNS"]
+    }
+}
