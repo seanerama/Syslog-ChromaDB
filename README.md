@@ -30,7 +30,7 @@ Transform your network logs into intelligent, searchable insights using GPU-acce
 - **Similarity scoring**: Results ranked by semantic similarity
 - **Metadata filtering**: Filter by source IP, facility, severity, timestamp
 - **🆕 Natural language chat**: Ask questions about your logs in plain English
-- **🆕 Local LLM integration**: Private AI conversations using Ollama
+- **🆕 Local LLM integration**: Private AI conversations using Ollama with customizable prompts
 
 ### 💾 Smart Storage
 - **Vector database**: ChromaDB for fast similarity search
@@ -103,13 +103,24 @@ Transform your network logs into intelligent, searchable insights using GPU-acce
 mkdir syslog-ai-analytics
 cd syslog-ai-analytics
 
-# Download the three main files:
+# Download the main files:
 # - syslog_chromadb_pipeline.py
 # - syslog_fastapi.py  
 # - requirements.txt
+# - prompts.json
 ```
 
-### 2. Install UV (Fast Python Package Manager)
+### 2. Configure Network-Specific Prompts
+
+```bash
+# Edit prompts.json to match your network infrastructure
+# Update device names, IP ranges, and terminology for better AI responses
+nano prompts.json  # or your preferred editor
+```
+
+**Important:** Customize `prompts.json` with your actual network details for significantly better AI chat responses.
+
+### 3. Install UV (Fast Python Package Manager)
 
 ```bash
 # Install uv for faster package management
@@ -120,7 +131,7 @@ export PATH="$HOME/.local/bin:$PATH"
 uv --version
 ```
 
-### 3. Create Virtual Environment
+### 4. Create Virtual Environment
 
 ```bash
 # Create and activate virtual environment
@@ -130,7 +141,7 @@ source .venv/bin/activate  # Linux/Mac
 .venv\Scripts\activate     # Windows
 ```
 
-### 4. Install Dependencies
+### 5. Install Dependencies
 
 ```bash
 # Install PyTorch with CUDA support first
@@ -147,7 +158,7 @@ uv pip install torch torchvision torchaudio --index-url https://download.pytorch
 uv pip install -r requirements.txt
 ```
 
-### 5. Verify Installation
+### 6. Verify Installation
 
 ```bash
 # Test CUDA availability
@@ -157,7 +168,7 @@ python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 python3 -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('mixedbread-ai/mxbai-embed-large-v1')"
 ```
 
-### 6. Install and Configure Ollama (for Chat Feature)
+### 7. Install and Configure Ollama (for Chat Feature)
 
 ```bash
 # Install Ollama for local LLM chat
@@ -175,6 +186,8 @@ ollama pull qwen2.5:7b-instruct   # Great instruction following
 # Test Ollama is working
 curl http://localhost:11434/api/tags
 ```
+
+### 8. Create Storage Directories
 
 ```bash
 # Create storage directories
@@ -215,6 +228,35 @@ config = {
     'max_size_gb': 10.0          # Database size limit
 }
 ```
+
+### Chat Prompts Configuration
+
+The system uses `prompts.json` to configure AI chat behavior. Customize this file for your specific network:
+
+```json
+{
+  "intent_parsing": {
+    "template": "Analyze this syslog query for our network infrastructure...\n\nOur Network Context:\n- Core routers: rtr-core-01, rtr-core-02\n- Access switches: sw-access-XX\n..."
+  },
+  "analysis_response": {
+    "template": "You are a network security expert...",
+    "no_results_template": "I searched the database but found no relevant entries..."
+  },
+  "network_config": {
+    "device_prefixes": ["rtr-", "sw-", "srv-", "fw-"],
+    "ip_ranges": ["10.0.0.0/8", "192.168.0.0/16"],
+    "severity_levels": {...}
+  }
+}
+```
+
+**Important:** Edit `prompts.json` to match your network:
+- Update device naming conventions (rtr-*, sw-*, etc.)
+- Add your actual IP ranges and subnets
+- Include organization-specific terminology
+- Customize severity handling and network context
+
+This configuration significantly improves AI response accuracy and relevance.
 
 ### Network Device Configuration
 
@@ -270,6 +312,10 @@ python3 syslog_fastapi.py
 - **🆕 Chat API**: POST http://localhost:8000/api/message
 
 ### 3. Chat with Your Logs
+
+#### Getting Better Chat Results
+
+**Important:** Ensure you've customized `prompts.json` with your actual network details. The AI provides much more accurate responses when it understands your specific infrastructure.
 
 #### Natural Language Queries
 Ask questions about your log data in plain English:
@@ -382,28 +428,6 @@ curl "http://localhost:8000/api/message?q=BGP issues today"
 
 ### Search Endpoints
 
-#### 🆕 POST /api/message
-**Natural language chat with your log data**
-
-```json
-{
-  "message": "Are there issues with rtr-01?",
-  "context": {}
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "response": "I found 3 error logs from rtr-01 showing BGP neighbor timeouts...",
-  "queries_executed": [
-    {"type": "semantic_search", "query": "rtr-01 error", "results": 5}
-  ],
-  "logs_found": 8
-}
-```
-
 #### POST /api/search
 **Semantic search through logs**
 
@@ -507,13 +531,16 @@ ollama pull llama3:8b-instruct
 # Edit syslog_fastapi.py and change model_name parameter
 ```
 
-#### Chat responses are poor quality
+#### Poor Chat Quality or Irrelevant Responses
 ```bash
-# Try a better instruction-tuned model
-ollama pull mistral:7b-instruct
-ollama pull qwen2.5:7b-instruct
+# Ensure prompts.json matches your network
+# Update device naming conventions in prompts.json
+# Verify IP ranges and network topology details
+# The AI needs accurate context about your infrastructure
 
-# Update the model name in the API configuration
+# Example: If your devices use different naming
+# Edit the device_prefixes in prompts.json:
+"device_prefixes": ["core-", "access-", "border-", "mgmt-"]
 ```
 
 #### "CUDA out of memory"
