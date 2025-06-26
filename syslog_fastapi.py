@@ -121,128 +121,101 @@ class SyslogChatBot:
             logger.error(f"Error calling Ollama: {e}")
             return f"Error communicating with AI model: {str(e)}"
     
-    def _parse_query_intent(self, message: str) -> Dict:
-        """Parse user message to understand intent and extract parameters"""
-        message_lower = message.lower()
+    async def _parse_query_intent_with_ollama(self, message: str) -> Dict:
+        """Use Ollama to parse user intent and extract parameters"""
         
-        # Extract potential device names/IPs
-        device_patterns = [
-            r'\b(?:rtr|router|switch|sw|firewall|fw|server|srv)-?(\w+)\b',
-            r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b',
-            r'\b(\w+)-(\d+)\b'  # device-01 patterns
-        ]
-        
-        devices = []
-        for pattern in device_patterns:
-            matches = re.finditer(pattern, message_lower)
-            for match in matches:
-                if '.' in match.group():  # IP address
-                    devices.append(match.group())
-                else:  # Device name
-                    devices.append(match.group())
-        
-        # Determine intent
-        intent = "general_search"
-        if any(word in message_lower for word in ["error", "issue", "problem", "fail", "down", "alert"]):
-            intent = "find_issues"
-        elif any(word in message_lower for word in ["show", "list", "get", "find"]):
-            intent = "show_logs"
-        elif any(word in message_lower for word in ["stat", "count", "how many", "summary"]):
-            intent = "get_stats"
-        elif any(word in message_lower for word in ["recent", "latest", "last", "today"]):
-            intent = "recent_logs"
-        
-        # Extract time references
-        time_refs = []
-        if "hour" in message_lower:
-            time_refs.append("1h")
-        elif "day" in message_lower or "today" in message_lower:
-            time_refs.append("1d")
-        elif "week" in message_lower:
-            time_refs.append("7d")
-        
-        # Extract severity keywords
-        severity_keywords = []
-        severity_map = {
-            "emergency": 0, "alert": 1, "critical": 2, "error": 3,
-            "warning": 4, "notice": 5, "info": 6, "debug": 7
-        }
-        for keyword, level in severity_map.items():
-            if keyword in message_lower:
-                severity_keywords.append(level)
-        
-        return {
-            "intent": intent,
-            "devices": devices,
-            "time_refs": time_refs,
-            "severity_keywords": severity_keywords,
-            "original_message": message
-        }
-    
-    async def _execute_search_queries(self, intent_data: Dict) -> List[Dict]:
-        """Execute appropriate database queries based on intent"""
+        intent_prompt = f"""Analyze this syslog query and extract structured information. Return ONLY a JSON object, no other text.
+
+    Query: "{message}"
+
+    Extract:
+    1. intent: one of ["find_issues", "show_logs", "get_stats", "recent_logs", "general_search"]
+    2. devices: list of device names, IPs, or hostnames mentioned
+    3. time_refs: list of time references like ["1h", "1d", "7d"] 
+    4. severity_keywords: list of severity levels (0-7: emergency, alert, critical, error, warning, notice, info, debug)
+    5. search_terms: key terms for semantic search
+
+    Rules:
+    - "error", "fail", "down", "issue" → intent: "find_issues"
+    - "show", "list", "get", "find" → intent: "show_logs"  
+    - "stats", "count", "how many" → intent: "get_stats"
+    - "recent", "latest", "last", "today" → intent: "recent_logs"
+    - Extract device patterns: router-01, 192.168.1.1, rtr-core, switch-access
+    - Map time words: "hour"→"1h", "day/today"→"1d", "week"→"7d"
+    - Map severity: "emergency"→0, "alert"→1, "critical"→2, "error"→3, "warning"→4, "notice"→5, "info"→6, "debug"→7
+
+    Return JSON format:
+    {{"intent": "...", "devices": [...], "time_refs": [...], "severity_keywords": [...], "search_terms": [...]}}"""
+
+        try:
+            response = await self._call_ollama(intent_prompt)
+            # Try to find JSON in response
+            import json
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                intent_data = json.loads(json_match.group())
+                intent_data["original_message"] = message
+                return intent_data
+            else:
+                raise ValueError("No JSON found")
+                        
+        except Exception as e:
+            logger.error(f"Ollama intent parsing failed: {e}")
+            # Fallback to rule-based parsing
+            return self._parse_query_intent_original(message)
+
+    async def _execute_search_queries_enhanced(self, intent_data: Dict) -> List[Dict]:
+        """Execute searches based on Ollama-parsed intent"""
         queries_executed = []
         all_results = []
         
         try:
-            # Build search queries based on intent
+            # Use extracted search_terms for more targeted queries
+            search_terms = intent_data.get("search_terms", [intent_data["original_message"]])
+            devices = intent_data.get("devices", [])
+            
             if intent_data["intent"] == "find_issues":
-                search_terms = ["error", "fail", "down", "timeout", "unreachable"]
-                if intent_data["devices"]:
-                    search_terms.extend(intent_data["devices"])
-                
-                for term in search_terms[:3]:  # Limit to 3 searches
-                    query = f"{term} " + " ".join(intent_data["devices"][:2])
+                # Combine issue terms with devices
+                for term in search_terms[:2]:
+                    query = f"{term} " + " ".join(devices[:2])
                     results = await self.api.search_semantic(query.strip(), n_results=5, threshold=0.3)
                     queries_executed.append({"type": "semantic_search", "query": query, "results": len(results["documents"][0])})
                     all_results.extend(results["documents"][0])
             
-            elif intent_data["intent"] == "show_logs" and intent_data["devices"]:
-                # Search for specific devices
-                for device in intent_data["devices"][:2]:  # Limit to 2 devices
-                    # Try semantic search first
+            elif intent_data["intent"] == "show_logs" and devices:
+                for device in devices[:2]:
                     results = await self.api.search_semantic(device, n_results=10, threshold=0.2)
                     queries_executed.append({"type": "semantic_search", "query": device, "results": len(results["documents"][0])})
                     all_results.extend(results["documents"][0])
-                    
-                    # Try filter search if device looks like IP
-                    if re.match(r'\d+\.\d+\.\d+\.\d+', device):
-                        filter_results = await self.api.search_filter({"source_ip": device}, n_results=5)
-                        queries_executed.append({"type": "filter_search", "filter": f"source_ip={device}", "results": len(filter_results["documents"][0])})
-                        all_results.extend(filter_results["documents"][0])
             
-            elif intent_data["intent"] == "recent_logs":
-                # Get recent logs with any severity filters
-                query = "recent logs"
-                if intent_data["severity_keywords"]:
-                    severity_names = ["emergency", "alert", "critical", "error", "warning", "notice", "info", "debug"]
-                    query += " " + " ".join([severity_names[sev] for sev in intent_data["severity_keywords"]])
-                
-                results = await self.api.search_semantic(query, n_results=10, threshold=0.1)
-                queries_executed.append({"type": "semantic_search", "query": query, "results": len(results["documents"][0])})
-                all_results.extend(results["documents"][0])
+            elif intent_data["intent"] == "get_stats":
+                # Could trigger stats API instead of search
+                stats = await self.api.get_stats()
+                return queries_executed, [f"Database contains {stats['total_documents']} logs from {stats.get('unique_sources', 0)} sources"]
             
             else:
-                # General search using the original message
-                results = await self.api.search_semantic(intent_data["original_message"], n_results=8, threshold=0.2)
-                queries_executed.append({"type": "semantic_search", "query": intent_data["original_message"], "results": len(results["documents"][0])})
-                all_results.extend(results["documents"][0])
+                # Use all search terms
+                for term in search_terms[:3]:
+                    results = await self.api.search_semantic(term, n_results=8, threshold=0.2)
+                    queries_executed.append({"type": "semantic_search", "query": term, "results": len(results["documents"][0])})
+                    all_results.extend(results["documents"][0])
             
-            return queries_executed, all_results[:15]  # Limit total results
-            
+            return queries_executed, all_results[:15]
+        
         except Exception as e:
-            logger.error(f"Error executing search queries: {e}")
+            logger.error(f"Error executing enhanced search queries: {e}")
             return queries_executed, []
+    
     
     async def process_message(self, message: str) -> Dict:
         """Process natural language message and return response"""
         try:
             # Parse intent
-            intent_data = self._parse_query_intent(message)
+            intent_data = await self._parse_query_intent_with_ollama(message)
             logger.info(f"Parsed intent: {intent_data}")
             
             # Execute database queries
-            queries_executed, search_results = await self._execute_search_queries(intent_data)
+            queries_executed, search_results = await self._execute_search_queries_enhanced(intent_data)
             
             # Build context for LLM
             context = {
@@ -1228,6 +1201,7 @@ async def chat_message_get(q: str):
     """GET-based chat interface for simple queries"""
     request = MessageRequest(message=q)
     return await chat_message(request)
+
 async def search_get(q: str, limit: int = 10, threshold: float = 0.0):
     """GET-based search for simple queries"""
     request = SearchRequest(query=q, limit=limit, threshold=threshold)
