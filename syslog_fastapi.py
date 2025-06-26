@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-FastAPI Syslog ChromaDB API with Real-time Dashboard
-Modern API with integrated web dashboard for syslog analysis
+FastAPI Syslog ChromaDB API with Local LLM Chat Integration
+Modern API with integrated web dashboard and Ollama chat for syslog analysis
 """
 
 from fastapi import FastAPI, HTTPException, Request
@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 import chromadb
 import os
 import ssl
@@ -18,13 +18,15 @@ import requests
 import torch
 from transformers import AutoTokenizer, AutoModel
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import traceback
 from functools import lru_cache
 import threading
 import asyncio
 import uvicorn
+import httpx
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +41,16 @@ class SearchRequest(BaseModel):
 class FilterRequest(BaseModel):
     filters: Dict
     limit: int = 100
+
+class MessageRequest(BaseModel):
+    message: str
+    context: Optional[Dict] = None
+
+class MessageResponse(BaseModel):
+    success: bool
+    response: str
+    queries_executed: Optional[List[Dict]] = None
+    logs_found: Optional[int] = None
 
 class SearchResult(BaseModel):
     similarity: float
@@ -60,12 +72,238 @@ class StatsResponse(BaseModel):
 
 # Initialize FastAPI
 app = FastAPI(
-    title="Syslog ChromaDB API",
-    description="AI-powered semantic search and analysis for syslog messages",
+    title="Syslog ChromaDB API with LLM Chat",
+    description="AI-powered semantic search and analysis for syslog messages with natural language chat",
     version="1.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
+
+class SyslogChatBot:
+    """Local LLM chat interface for syslog analysis"""
+    
+    def __init__(self, ollama_host: str = "http://localhost:11434", model_name: str = "llama3.1:8b"):
+        self.ollama_host = ollama_host
+        self.model_name = model_name
+        self.api = None  # Will be set later
+        
+    def set_api_reference(self, api_instance):
+        """Set reference to main API for database queries"""
+        self.api = api_instance
+    
+    async def _call_ollama(self, prompt: str) -> str:
+        """Call Ollama API"""
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    f"{self.ollama_host}/api/generate",
+                    json={
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.1,  # Low temperature for more consistent responses
+                            "top_p": 0.9
+                        }
+                    }
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    return result.get("response", "")
+                else:
+                    logger.error(f"Ollama API error: {response.status_code} - {response.text}")
+                    return "I'm having trouble connecting to the AI model. Please check if Ollama is running."
+                    
+        except httpx.TimeoutException:
+            return "The AI model is taking too long to respond. Please try again."
+        except Exception as e:
+            logger.error(f"Error calling Ollama: {e}")
+            return f"Error communicating with AI model: {str(e)}"
+    
+    def _parse_query_intent(self, message: str) -> Dict:
+        """Parse user message to understand intent and extract parameters"""
+        message_lower = message.lower()
+        
+        # Extract potential device names/IPs
+        device_patterns = [
+            r'\b(?:rtr|router|switch|sw|firewall|fw|server|srv)-?(\w+)\b',
+            r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b',
+            r'\b(\w+)-(\d+)\b'  # device-01 patterns
+        ]
+        
+        devices = []
+        for pattern in device_patterns:
+            matches = re.finditer(pattern, message_lower)
+            for match in matches:
+                if '.' in match.group():  # IP address
+                    devices.append(match.group())
+                else:  # Device name
+                    devices.append(match.group())
+        
+        # Determine intent
+        intent = "general_search"
+        if any(word in message_lower for word in ["error", "issue", "problem", "fail", "down", "alert"]):
+            intent = "find_issues"
+        elif any(word in message_lower for word in ["show", "list", "get", "find"]):
+            intent = "show_logs"
+        elif any(word in message_lower for word in ["stat", "count", "how many", "summary"]):
+            intent = "get_stats"
+        elif any(word in message_lower for word in ["recent", "latest", "last", "today"]):
+            intent = "recent_logs"
+        
+        # Extract time references
+        time_refs = []
+        if "hour" in message_lower:
+            time_refs.append("1h")
+        elif "day" in message_lower or "today" in message_lower:
+            time_refs.append("1d")
+        elif "week" in message_lower:
+            time_refs.append("7d")
+        
+        # Extract severity keywords
+        severity_keywords = []
+        severity_map = {
+            "emergency": 0, "alert": 1, "critical": 2, "error": 3,
+            "warning": 4, "notice": 5, "info": 6, "debug": 7
+        }
+        for keyword, level in severity_map.items():
+            if keyword in message_lower:
+                severity_keywords.append(level)
+        
+        return {
+            "intent": intent,
+            "devices": devices,
+            "time_refs": time_refs,
+            "severity_keywords": severity_keywords,
+            "original_message": message
+        }
+    
+    async def _execute_search_queries(self, intent_data: Dict) -> List[Dict]:
+        """Execute appropriate database queries based on intent"""
+        queries_executed = []
+        all_results = []
+        
+        try:
+            # Build search queries based on intent
+            if intent_data["intent"] == "find_issues":
+                search_terms = ["error", "fail", "down", "timeout", "unreachable"]
+                if intent_data["devices"]:
+                    search_terms.extend(intent_data["devices"])
+                
+                for term in search_terms[:3]:  # Limit to 3 searches
+                    query = f"{term} " + " ".join(intent_data["devices"][:2])
+                    results = await self.api.search_semantic(query.strip(), n_results=5, threshold=0.3)
+                    queries_executed.append({"type": "semantic_search", "query": query, "results": len(results["documents"][0])})
+                    all_results.extend(results["documents"][0])
+            
+            elif intent_data["intent"] == "show_logs" and intent_data["devices"]:
+                # Search for specific devices
+                for device in intent_data["devices"][:2]:  # Limit to 2 devices
+                    # Try semantic search first
+                    results = await self.api.search_semantic(device, n_results=10, threshold=0.2)
+                    queries_executed.append({"type": "semantic_search", "query": device, "results": len(results["documents"][0])})
+                    all_results.extend(results["documents"][0])
+                    
+                    # Try filter search if device looks like IP
+                    if re.match(r'\d+\.\d+\.\d+\.\d+', device):
+                        filter_results = await self.api.search_filter({"source_ip": device}, n_results=5)
+                        queries_executed.append({"type": "filter_search", "filter": f"source_ip={device}", "results": len(filter_results["documents"][0])})
+                        all_results.extend(filter_results["documents"][0])
+            
+            elif intent_data["intent"] == "recent_logs":
+                # Get recent logs with any severity filters
+                query = "recent logs"
+                if intent_data["severity_keywords"]:
+                    severity_names = ["emergency", "alert", "critical", "error", "warning", "notice", "info", "debug"]
+                    query += " " + " ".join([severity_names[sev] for sev in intent_data["severity_keywords"]])
+                
+                results = await self.api.search_semantic(query, n_results=10, threshold=0.1)
+                queries_executed.append({"type": "semantic_search", "query": query, "results": len(results["documents"][0])})
+                all_results.extend(results["documents"][0])
+            
+            else:
+                # General search using the original message
+                results = await self.api.search_semantic(intent_data["original_message"], n_results=8, threshold=0.2)
+                queries_executed.append({"type": "semantic_search", "query": intent_data["original_message"], "results": len(results["documents"][0])})
+                all_results.extend(results["documents"][0])
+            
+            return queries_executed, all_results[:15]  # Limit total results
+            
+        except Exception as e:
+            logger.error(f"Error executing search queries: {e}")
+            return queries_executed, []
+    
+    async def process_message(self, message: str) -> Dict:
+        """Process natural language message and return response"""
+        try:
+            # Parse intent
+            intent_data = self._parse_query_intent(message)
+            logger.info(f"Parsed intent: {intent_data}")
+            
+            # Execute database queries
+            queries_executed, search_results = await self._execute_search_queries(intent_data)
+            
+            # Build context for LLM
+            context = {
+                "user_question": message,
+                "intent": intent_data["intent"],
+                "devices_mentioned": intent_data["devices"],
+                "queries_executed": queries_executed,
+                "total_results_found": len(search_results),
+                "sample_logs": search_results[:5]  # Send top 5 to LLM
+            }
+            
+            # Create prompt for LLM
+            llm_prompt = self._build_llm_prompt(context)
+            
+            # Get LLM response
+            llm_response = await self._call_ollama(llm_prompt)
+            
+            return {
+                "success": True,
+                "response": llm_response,
+                "queries_executed": queries_executed,
+                "logs_found": len(search_results)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+            return {
+                "success": False,
+                "response": f"I encountered an error while processing your question: {str(e)}",
+                "queries_executed": [],
+                "logs_found": 0
+            }
+    
+    def _build_llm_prompt(self, context: Dict) -> str:
+        """Build prompt for LLM based on context and search results"""
+        
+        sample_logs_text = ""
+        if context["sample_logs"]:
+            sample_logs_text = "\n".join([f"- {log}" for log in context["sample_logs"][:5]])
+        else:
+            sample_logs_text = "No relevant logs found."
+        
+        prompt = f"""You are a network security and log analysis expert. A user asked: "{context['user_question']}"
+
+I searched the syslog database and found {context['total_results_found']} relevant log entries.
+
+Here are the most relevant logs:
+{sample_logs_text}
+
+Database queries executed:
+{json.dumps(context['queries_executed'], indent=2)}
+
+Please analyze these logs and provide a helpful, concise response to the user's question. Focus on:
+1. Direct answer to their question
+2. Any issues or patterns you identify
+3. Specific details from the logs that are relevant
+4. If no relevant logs were found, suggest alternative search terms or indicate this
+
+Keep your response focused and actionable. If you see error patterns or issues, mention them specifically."""
+
+        return prompt
 
 class SyslogAPI:
     """API interface for syslog ChromaDB queries"""
@@ -282,9 +520,225 @@ class SyslogAPI:
         except Exception as e:
             logger.error(f"Stats error: {e}")
             raise
+    """API interface for syslog ChromaDB queries"""
+    
+    def __init__(self, db_path: str = "/var/syslog_chromadb", model_name: str = "mixedbread-ai/mxbai-embed-large-v1"):
+        self.db_path = db_path
+        self.model_name = model_name
+        self.model = None
+        self.tokenizer = None
+        self.device = None
+        self.client = None
+        self.collection = None
+        self._model_lock = threading.Lock()
+        
+        # Setup environment
+        self._setup_environment()
+        
+        # Initialize ChromaDB
+        self._init_chromadb()
+        
+        # Initialize model
+        self._init_model()
+    
+    def _setup_environment(self):
+        """Setup environment for corporate network"""
+        os.environ['HF_HOME'] = '/var/cache/huggingface'
+        os.environ['TRANSFORMERS_CACHE'] = '/var/cache/huggingface'
+        
+        ssl._create_default_https_context = ssl._create_unverified_context
+        urllib3.disable_warnings()
+        
+        original_send = requests.adapters.HTTPAdapter.send
+        def bypass_ssl_send(self, request, *args, **kwargs):
+            kwargs['verify'] = False
+            return original_send(self, request, *args, **kwargs)
+        requests.adapters.HTTPAdapter.send = bypass_ssl_send
+    
+    def _init_chromadb(self):
+        """Initialize ChromaDB connection"""
+        try:
+            self.client = chromadb.PersistentClient(path=self.db_path)
+            self.collection = self.client.get_collection("syslog_messages")
+            logger.info(f"Connected to ChromaDB: {self.collection.count():,} documents")
+        except Exception as e:
+            logger.error(f"Failed to connect to ChromaDB: {e}")
+            raise
+    
+    def _init_model(self):
+        """Initialize embedding model"""
+        try:
+            with self._model_lock:
+                if self.model is None:
+                    logger.info(f"Loading embedding model: {self.model_name}")
+                    self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                    self.model = AutoModel.from_pretrained(self.model_name)
+                    self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    self.model.to(self.device)
+                    self.model.eval()
+                    logger.info(f"Model loaded on {self.device}")
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            raise
+    
+    @lru_cache(maxsize=100)
+    def _encode_query(self, query_text: str):
+        """Encode query text to embedding vector (cached)"""
+        if not self.model or not self.tokenizer:
+            raise Exception("Model not initialized")
+        
+        with torch.no_grad():
+            inputs = self.tokenizer(
+                query_text,
+                padding=True,
+                truncation=True,
+                max_length=256,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            outputs = self.model(**inputs)
+            
+            # Mean pooling
+            attention_mask = inputs['attention_mask']
+            token_embeddings = outputs.last_hidden_state
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            embeddings = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            
+            # Normalize embeddings
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+            
+            return embeddings.cpu().numpy()
+    
+    def _get_database_size(self) -> float:
+        """Get database size in GB"""
+        try:
+            total_size = 0
+            for dirpath, dirnames, filenames in os.walk(self.db_path):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    if os.path.exists(filepath):
+                        total_size += os.path.getsize(filepath)
+            return total_size / (1024**3)  # Convert to GB
+        except Exception:
+            return 0.0
+    
+    async def search_semantic(self, query: str, n_results: int = 10, threshold: float = 0.0) -> Dict:
+        """Perform semantic search"""
+        try:
+            query_embedding = self._encode_query(query)
+            
+            results = self.collection.query(
+                query_embeddings=query_embedding.tolist(),
+                n_results=n_results,
+                include=['documents', 'metadatas', 'distances']
+            )
+            
+            # Filter by similarity threshold
+            filtered_results = {
+                'documents': [[]],
+                'metadatas': [[]],
+                'distances': [[]]
+            }
+            
+            for doc, meta, dist in zip(results['documents'][0], results['metadatas'][0], results['distances'][0]):
+                similarity = 1 - dist
+                if similarity >= threshold:
+                    filtered_results['documents'][0].append(doc)
+                    filtered_results['metadatas'][0].append(meta)
+                    filtered_results['distances'][0].append(dist)
+            
+            return filtered_results
+            
+        except Exception as e:
+            logger.error(f"Search error: {e}")
+            raise
+    
+    async def search_filter(self, filters: Dict, n_results: int = 100) -> Dict:
+        """Search using metadata filters"""
+        try:
+            dummy_embedding = self._encode_query("filter")
+            
+            results = self.collection.query(
+                query_embeddings=dummy_embedding.tolist(),
+                n_results=n_results,
+                where=filters,
+                include=['documents', 'metadatas']
+            )
+            return results
+        except Exception as e:
+            logger.error(f"Filter search error: {e}")
+            raise
+    
+    async def get_stats(self) -> Dict:
+        """Get database statistics"""
+        try:
+            total_count = self.collection.count()
+            
+            stats = {
+                'total_documents': total_count,
+                'database_path': self.db_path,
+                'database_size_gb': round(self._get_database_size(), 2),
+                'model': self.model_name,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            if total_count > 0:
+                sample_size = min(1000, total_count)
+                dummy_embedding = self._encode_query("sample")
+                
+                sample_results = self.collection.query(
+                    query_embeddings=dummy_embedding.tolist(),
+                    n_results=sample_size,
+                    include=['metadatas']
+                )
+                
+                stats['sample_size'] = sample_size
+                
+                if sample_results['metadatas'] and sample_results['metadatas'][0]:
+                    metadatas = sample_results['metadatas'][0]
+                    
+                    facilities = {}
+                    severities = {}
+                    sources = set()
+                    timestamps = []
+                    
+                    for metadata in metadatas:
+                        if metadata.get('facility') is not None:
+                            facilities[metadata['facility']] = facilities.get(metadata['facility'], 0) + 1
+                        if metadata.get('severity') is not None:
+                            severities[metadata['severity']] = severities.get(metadata['severity'], 0) + 1
+                        if metadata.get('source_ip'):
+                            sources.add(metadata['source_ip'])
+                        if metadata.get('timestamp'):
+                            timestamps.append(metadata['timestamp'])
+                    
+                    stats.update({
+                        'facilities': facilities,
+                        'severities': severities,
+                        'unique_sources': len(sources),
+                        'top_sources': list(sources)[:10]
+                    })
+                    
+                    if timestamps:
+                        timestamps.sort()
+                        stats['time_range'] = {
+                            'earliest': timestamps[0],
+                            'latest': timestamps[-1]
+                        }
+            else:
+                stats['sample_size'] = 0
+                stats['message'] = 'No documents in database yet'
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Stats error: {e}")
+            raise
 
-# Initialize API
+# Initialize API and ChatBot
 api = SyslogAPI()
+chatbot = SyslogChatBot()
+chatbot.set_api_reference(api)
 
 # Dashboard HTML template
 dashboard_html = """
@@ -376,6 +830,8 @@ dashboard_html = """
             transition: background 0.2s;
         }
         .search-box button:hover { background: #5a67d8; }
+        .chat-button { background: #38b2ac !important; }
+        .chat-button:hover { background: #319795 !important; }
         .results { margin-top: 20px; }
         .result-item { 
             background: white;
@@ -396,6 +852,30 @@ dashboard_html = """
             background: #f7fafc;
             padding: 8px;
             border-radius: 4px;
+        }
+        .chat-response {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            margin-bottom: 15px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .chat-response h4 {
+            margin: 0 0 10px 0;
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+        .chat-response .response-text {
+            font-size: 1rem;
+            line-height: 1.6;
+            margin-bottom: 15px;
+        }
+        .chat-response .meta-info {
+            font-size: 0.85rem;
+            opacity: 0.8;
+            border-top: 1px solid rgba(255,255,255,0.2);
+            padding-top: 10px;
         }
         .chart-container { height: 300px; position: relative; }
         .refresh-btn {
@@ -426,12 +906,17 @@ dashboard_html = """
     <div class="container">
         <div class="header">
             <h1>🔍 Syslog Analytics Dashboard</h1>
-            <p>AI-powered semantic search and real-time monitoring</p>
+            <p>AI-powered semantic search and real-time monitoring with natural language chat</p>
         </div>
 
         <div class="search-box">
             <input type="text" id="searchInput" placeholder="Search logs semantically (e.g., 'BGP neighbor down', 'authentication failed')">
             <button onclick="searchLogs()">Search</button>
+        </div>
+
+        <div class="search-box">
+            <input type="text" id="chatInput" placeholder="Ask a question about your logs (e.g., 'Are there issues with rtr-01?', 'What happened in the last hour?')">
+            <button onclick="askQuestion()" style="background: #38b2ac;">Ask AI</button>
         </div>
 
         <div class="grid">
@@ -440,6 +925,7 @@ dashboard_html = """
                 <div class="stat-value" id="totalDocs">-</div>
                 <div class="stat-label">Total Documents</div>
                 <div style="margin-top: 15px;">
+                    <div style="font-size: 1rem; font-weight: 500; color: #2d3748; margin-bottom: 8px;">Top 5 Sources by Message Count:</div>
                     <div style="font-size: 1.2rem; color: #2d3748;" id="dbSize">- GB</div>
                     <div class="stat-label">Database Size</div>
                 </div>
@@ -458,13 +944,6 @@ dashboard_html = """
                     <canvas id="severityChart"></canvas>
                 </div>
             </div>
-
-            <div class="card">
-                <h3><span class="icon" style="background: #38b2ac; color: white;">🔧</span>Facility Distribution</h3>
-                <div class="chart-container">
-                    <canvas id="facilityChart"></canvas>
-                </div>
-            </div>
         </div>
 
         <div class="results" id="searchResults"></div>
@@ -477,12 +956,11 @@ dashboard_html = """
     <button class="refresh-btn" onclick="loadStats()" title="Refresh Data">🔄</button>
 
     <script>
-        let severityChart, facilityChart;
+        let severityChart;
 
         // Initialize charts
         function initCharts() {
             const severityCtx = document.getElementById('severityChart').getContext('2d');
-            const facilityCtx = document.getElementById('facilityChart').getContext('2d');
 
             severityChart = new Chart(severityCtx, {
                 type: 'doughnut',
@@ -490,16 +968,6 @@ dashboard_html = """
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: { legend: { position: 'bottom' } }
-                }
-            });
-
-            facilityChart = new Chart(facilityCtx, {
-                type: 'bar',
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: { legend: { display: false } },
-                    scales: { y: { beginAtZero: true } }
                 }
             });
         }
@@ -520,8 +988,12 @@ dashboard_html = """
                     
                     // Update top sources
                     if (stats.top_sources) {
-                        document.getElementById('topSources').innerHTML = 
-                            stats.top_sources.slice(0, 3).map(ip => `<div style="font-size: 0.9rem; margin: 2px 0;">${ip}</div>`).join('');
+                        const topSourcesHtml = stats.top_sources.slice(0, 5).map((ip, index) => 
+                            `<div style="font-size: 0.85rem; margin: 3px 0; padding: 2px 0;">
+                                <span style="font-weight: 500;">${index + 1}.</span> ${ip}
+                            </div>`
+                        ).join('');
+                        document.getElementById('topSources').innerHTML = topSourcesHtml;
                     }
                     
                     // Update severity chart
@@ -541,27 +1013,73 @@ dashboard_html = """
                         };
                         severityChart.update();
                     }
-                    
-                    // Update facility chart
-                    if (stats.facilities) {
-                        const facilityNames = {21: 'Local5', 16: 'Local0', 17: 'Local1', 18: 'Local2', 19: 'Local3', 20: 'Local4', 22: 'Local6', 23: 'Local7'};
-                        const facilityData = Object.entries(stats.facilities).map(([k, v]) => ({
-                            label: facilityNames[k] || `Facility ${k}`,
-                            value: v
-                        }));
-                        
-                        facilityChart.data = {
-                            labels: facilityData.map(d => d.label),
-                            datasets: [{
-                                data: facilityData.map(d => d.value),
-                                backgroundColor: '#667eea'
-                            }]
-                        };
-                        facilityChart.update();
-                    }
                 }
             } catch (error) {
                 console.error('Error loading stats:', error);
+            }
+        }
+
+        // Ask AI question
+        async function askQuestion() {
+            const question = document.getElementById('chatInput').value.trim();
+            if (!question) return;
+
+            const resultsDiv = document.getElementById('searchResults');
+            const loading = document.getElementById('loading');
+            
+            loading.style.display = 'block';
+            resultsDiv.innerHTML = '';
+
+            try {
+                const response = await fetch('/api/message', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: question })
+                });
+                
+                const data = await response.json();
+                loading.style.display = 'none';
+                
+                if (data.success) {
+                    resultsDiv.innerHTML = `
+                        <div class="card">
+                            <div class="chat-response">
+                                <h4>🤖 AI Analysis</h4>
+                                <div class="response-text">${data.response}</div>
+                                <div class="meta-info">
+                                    Found ${data.logs_found || 0} relevant logs • 
+                                    Executed ${data.queries_executed?.length || 0} queries
+                                </div>
+                            </div>
+                            ${data.queries_executed && data.queries_executed.length > 0 ? `
+                                <h4>🔍 Queries Executed</h4>
+                                ${data.queries_executed.map(query => `
+                                    <div style="background: #f8f9fa; padding: 10px; margin: 5px 0; border-radius: 5px; font-size: 0.9rem;">
+                                        <strong>${query.type}:</strong> ${query.query || query.filter} 
+                                        <span style="color: #666;">(${query.results} results)</span>
+                                    </div>
+                                `).join('')}
+                            ` : ''}
+                        </div>
+                    `;
+                } else {
+                    resultsDiv.innerHTML = `
+                        <div class="card">
+                            <h3>🤖 AI Response</h3>
+                            <p style="color: #e53e3e;">Error: ${data.response || 'Failed to get AI response'}</p>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                loading.style.display = 'none';
+                resultsDiv.innerHTML = `
+                    <div class="card">
+                        <h3>🤖 AI Response</h3>
+                        <p style="color: #e53e3e;">Error: ${error.message}</p>
+                        <p style="font-size: 0.9rem; color: #666;">Make sure Ollama is running and a model is installed.</p>
+                    </div>
+                `;
+                console.error('Chat error:', error);
             }
         }
 
@@ -617,9 +1135,13 @@ dashboard_html = """
             }
         }
 
-        // Handle Enter key in search
+        // Handle Enter key in search and chat inputs
         document.getElementById('searchInput').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') searchLogs();
+        });
+        
+        document.getElementById('chatInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') askQuestion();
         });
 
         // Initialize
@@ -681,7 +1203,31 @@ async def search(request: SearchRequest):
         logger.error(f"Search error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/search")
+@app.post("/api/message", response_model=MessageResponse)
+async def chat_message(request: MessageRequest):
+    """Natural language chat interface for syslog analysis"""
+    try:
+        if not request.message.strip():
+            raise HTTPException(status_code=400, detail="Message cannot be empty")
+        
+        result = await chatbot.process_message(request.message)
+        
+        return MessageResponse(
+            success=result["success"],
+            response=result["response"],
+            queries_executed=result.get("queries_executed"),
+            logs_found=result.get("logs_found")
+        )
+        
+    except Exception as e:
+        logger.error(f"Chat message error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/message")
+async def chat_message_get(q: str):
+    """GET-based chat interface for simple queries"""
+    request = MessageRequest(message=q)
+    return await chat_message(request)
 async def search_get(q: str, limit: int = 10, threshold: float = 0.0):
     """GET-based search for simple queries"""
     request = SearchRequest(query=q, limit=limit, threshold=threshold)
@@ -738,11 +1284,13 @@ async def health_check():
         }
 
 if __name__ == '__main__':
-    print("🚀 Starting Syslog ChromaDB FastAPI")
+    print("🚀 Starting Syslog ChromaDB FastAPI with LLM Chat")
     print(f"📊 Database: {api.db_path}")
     print(f"📄 Documents: {api.collection.count():,}")
     print(f"🔥 Model: {api.model_name}")
+    print(f"🤖 Chat LLM: {chatbot.model_name}")
     print("🌐 Dashboard: http://localhost:8000")
     print("📋 API Docs: http://localhost:8000/api/docs")
+    print("💬 Chat: POST /api/message")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
